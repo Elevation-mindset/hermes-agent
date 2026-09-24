@@ -20,10 +20,10 @@ import { localPreviewTarget } from '@/lib/local-preview'
  * SIZE IS CONTENT-DRIVEN. The opaque origin means the parent can't measure
  * the document, but we own the srcdoc string — an injected script posts the
  * content's size up via postMessage (tagged with a per-mount token). Height
- * tracks live within the clamp band; width adopts ONCE from the first
- * report, so a fixed-size widget shrink-wraps and sits left in the message
- * flow like an image, while a fluid page measures the full viewport and
- * stays column-wide. A `height="480"` attribute only sets the starting
+ * tracks live within the clamp band; width adopts from the reports but only
+ * ever GROWS — a fixed-size widget shrink-wraps and sits left in the message
+ * flow like an image, a fluid page stays column-wide, and a late-measured
+ * wide table widens the frame instead of clipping. A `height="480"`
  * height — measurement always wins.
  *
  * NATIVE BY DEFAULT. A theme prelude injects first: the app's resolved
@@ -122,10 +122,17 @@ export function intentFromMessage(data: unknown, token: string): string | null {
 const THEME_BRIDGE_TOKENS: Record<string, string> = {
   '--foreground': '--ui-text-primary',
   '--muted-foreground': '--ui-text-tertiary',
-  '--accent': '--ui-accent',
   '--border': '--ui-stroke-tertiary',
-  '--card': '--ui-bg-editor'
+  '--card': '--ui-bg-card'
 }
+
+/** How much raw theme accent survives in the bridged `--accent`. Widgets use
+ *  the accent as TEXT color (headings, warns) far more than as a fill, and the
+ *  raw midground is tuned for buttons/borders — on the dark chat surface it
+ *  reads harsh and low-contrast as body-scale text. Mixing it toward the
+ *  resolved foreground keeps the hue while guaranteeing legibility (the same
+ *  trick the app itself uses for accent-colored text, `--ref-color`). */
+const ACCENT_TEXT_MIX = 0.72
 
 /** Resolve the bridge tokens + app font against the current document. */
 export function collectThemeBridge(): { vars: Record<string, string>; font: string } {
@@ -140,6 +147,18 @@ export function collectThemeBridge(): { vars: Record<string, string>; font: stri
       if (value) {
         vars[alias] = value
       }
+    }
+
+    // `--accent` is bridged separately: text-legible by construction, not the
+    // raw theme midground. Falls back to the raw accent when the foreground
+    // didn't resolve (nothing to mix toward).
+    const accent = root.getPropertyValue('--ui-accent').trim()
+    const foreground = vars['--foreground']
+
+    if (accent) {
+      vars['--accent'] = foreground
+        ? `color-mix(in srgb, ${accent} ${Math.round(ACCENT_TEXT_MIX * 100)}%, ${foreground})`
+        : accent
     }
   }
 
@@ -164,6 +183,7 @@ export function themePrelude(vars: Record<string, string>, font: string): string
 
   return (
     `<style>:root{${tokens}}` +
+    `html{scrollbar-width:thin;scrollbar-color:var(--border,transparent) transparent}` +
     `html,body{margin:0;padding:0;background:transparent;color:var(--foreground,inherit);${fontRule}}</style>`
   )
 }
@@ -184,6 +204,7 @@ export function measurementScript(token: string): string {
     'var r=kids[i].getBoundingClientRect();if(r.width===0&&r.height===0)continue;' +
     'if(r.left<L)L=r.left;if(r.right>R)R=r.right}' +
     'if(R>L)w=R-L}' +
+    'if(d&&d.scrollWidth>w)w=d.scrollWidth;' +
     'w=Math.ceil(w);' +
     'if(Math.abs(h-lastH)>1||Math.abs(w-lastW)>1){lastH=h;lastW=w;parent.postMessage({type:' +
     JSON.stringify(SIZE_MESSAGE_TYPE) +
@@ -194,13 +215,29 @@ export function measurementScript(token: string): string {
   )
 }
 
-/** Assemble the srcdoc: theme prelude first (so the page's own styles win),
- *  then the measuring + intent scripts before `</body>` when present so they
- *  run after the page's own markup, appended otherwise. */
+/** Assemble the srcdoc: theme prelude injected as the FIRST thing inside
+ *  `<head>` (so the page's own styles still override it) — critically, AFTER
+ *  the doctype. Prepending a `<style>` before `<!DOCTYPE html>` (the old
+ *  behavior) silently throws the whole document into quirks mode: tables
+ *  mis-size, `width:100%` stops filling, scrollHeight lies — the entire
+ *  "broken widget" class of symptoms. Falls back to just inside `<html>`,
+ *  then to prepending for headless fragments (already modeless). */
 export function withInlineChrome(doc: string, token: string, prelude: string): string {
   const script = measurementScript(token) + intentScript(token)
   const bodyClose = /<\/body\s*>/i.exec(doc)
   const framed = bodyClose ? doc.slice(0, bodyClose.index) + script + doc.slice(bodyClose.index) : doc + script
+
+  const headOpen = /<head[^>]*>/i.exec(framed)
+
+  if (headOpen) {
+    return framed.slice(0, headOpen.index + headOpen[0].length) + prelude + framed.slice(headOpen.index + headOpen[0].length)
+  }
+
+  const htmlOpen = /<html[^>]*>/i.exec(framed)
+
+  if (htmlOpen) {
+    return framed.slice(0, htmlOpen.index + htmlOpen[0].length) + prelude + framed.slice(htmlOpen.index + htmlOpen[0].length)
+  }
 
   return prelude + framed
 }
@@ -356,12 +393,14 @@ function InlineHtmlFrame({
         Math.abs(next.height - (prev ?? initialHeight ?? DEFAULT_HEIGHT)) > RESIZE_TOLERANCE ? next.height : prev
       )
 
-      // Width adopts ONCE, from the first report — measured at full column
-      // width, so it is the content's intrinsic span. Tracking width live
-      // would feedback-loop: %-width children reflow narrower every time
-      // the frame shrinks, spiraling toward zero.
+      // Width adopts from the reports but only ever GROWS: the first report
+      // can land before web fonts/late styles settle and under-measure, and
+      // a wide table appearing later must widen the frame, not clip inside
+      // it. Growing is feedback-safe — more room never makes content
+      // reflow narrower; shrinking is (the %-width spiral), so it stays
+      // adopt-once.
       if (next.width > 0) {
-        setContentWidth(prev => prev ?? next.width)
+        setContentWidth(prev => (prev === null || next.width > prev ? next.width : prev))
       }
     }
 
@@ -400,7 +439,7 @@ function InlineHtmlFrame({
         />
       ) : (
         <span
-          className="relative block max-w-full transition-[height] duration-200"
+          className="relative block max-w-full overflow-hidden rounded-lg ring-1 ring-(--ui-stroke-tertiary) transition-[height] duration-200"
           style={{ height, width: width ?? '100%' }}
         >
           <iframe

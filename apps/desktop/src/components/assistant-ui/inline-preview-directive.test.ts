@@ -26,12 +26,24 @@ describe('directiveFrameHeight', () => {
 describe('withInlineChrome', () => {
   const prelude = themePrelude({ '--foreground': '#eee' }, 'Inter')
 
-  it('puts the theme prelude FIRST so page styles override it', () => {
-    const doc = '<html><head><style>body{color:red}</style></head><body><h1>hi</h1></body></html>'
+  it('injects the prelude inside <head>, before page styles, after the doctype', () => {
+    const doc = '<!DOCTYPE html><html><head><style>body{color:red}</style></head><body><h1>hi</h1></body></html>'
     const framed = withInlineChrome(doc, 'tok', prelude)
 
-    expect(framed.startsWith(prelude)).toBe(true)
+    // Quirks-mode regression: the prelude must never sit before the doctype
+    // (a stray <style> there silently flips the whole document into quirks
+    // mode — mis-sized tables, lying scrollHeight).
+    expect(framed.startsWith('<!DOCTYPE html>')).toBe(true)
+    const head = framed.indexOf('<head>')
+    expect(framed.indexOf(prelude)).toBeGreaterThan(head)
     expect(framed.indexOf(prelude)).toBeLessThan(framed.indexOf('color:red'))
+  })
+
+  it('falls back to just inside <html> when there is no head', () => {
+    const framed = withInlineChrome('<html><body><h1>hi</h1></body></html>', 'tok', prelude)
+
+    expect(framed.indexOf(prelude)).toBeGreaterThan(framed.indexOf('<html>'))
+    expect(framed.indexOf(prelude)).toBeLessThan(framed.indexOf('<body>'))
   })
 
   it('injects the measuring script before </body>', () => {
